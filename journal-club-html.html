@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Journal Club</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  .line-clamp-4 { display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body class="bg-slate-50">
+
+<!-- ============================================================= -->
+<!--  CONFIG: paste your Supabase project URL and anon key here.    -->
+<!--  Find them in Supabase > Project Settings > API                -->
+<!-- ============================================================= -->
+<script>
+  const SUPABASE_URL = 'https://cekgjxjkmvxkjxjxwpzc.supabase.co/';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNla2dqeGprbXZ4a2p4anh3cHpjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkwNTE4NDIsImV4cCI6MjEwNDYyNzg0Mn0.jqUhT6psxTL0v5ZEJt8Og7I_XS-vOR2tDdcacpKqmoQ';
+</script>
+
+<div id="app" class="max-w-2xl mx-auto px-4 py-8"></div>
+
+<!-- Modal mount -->
+<div id="modal-root"></div>
+
+<script>
+// ---------- Setup guard ----------
+const configured = SUPABASE_URL && SUPABASE_URL !== 'YOUR_SUPABASE_URL' &&
+                   SUPABASE_ANON_KEY && SUPABASE_ANON_KEY !== 'YOUR_SUPABASE_ANON_KEY';
+
+let sb = null;
+if (configured) {
+  sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
+
+// ---------- Identity (per-browser voter id + display name) ----------
+function getVoterId() {
+  let id = localStorage.getItem('jc-voter-id');
+  if (!id) { id = 'v-' + Math.random().toString(36).slice(2, 12); localStorage.setItem('jc-voter-id', id); }
+  return id;
+}
+function getName() { return localStorage.getItem('jc-name') || ''; }
+function setName(n) { localStorage.setItem('jc-name', n); }
+const voterId = getVoterId();
+
+// ---------- State ----------
+let state = { papers: [], votes: [], sortBy: 'top', activeTag: null, loading: true };
+
+// ---------- Utils ----------
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.floor(s/60); if (m < 60) return m+'m ago';
+  const h = Math.floor(m/60); if (h < 24) return h+'h ago';
+  return Math.floor(h/24)+'d ago';
+}
+const TAG_COLORS = [
+  'bg-indigo-100 text-indigo-700 border-indigo-200',
+  'bg-emerald-100 text-emerald-700 border-emerald-200',
+  'bg-amber-100 text-amber-700 border-amber-200',
+  'bg-rose-100 text-rose-700 border-rose-200',
+  'bg-sky-100 text-sky-700 border-sky-200',
+  'bg-purple-100 text-purple-700 border-purple-200',
+  'bg-teal-100 text-teal-700 border-teal-200',
+  'bg-orange-100 text-orange-700 border-orange-200',
+];
+function tagColor(tag) {
+  let h = 0; for (let i=0;i<tag.length;i++) h = tag.charCodeAt(i)+((h<<5)-h);
+  return TAG_COLORS[Math.abs(h)%TAG_COLORS.length];
+}
+
+// ---------- Metadata fetching (client-side, CORS-friendly APIs) ----------
+async function fetchPubMedByPMID(pmid) {
+  const sres = await fetch(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=${pmid}&retmode=json`);
+  const sjson = await sres.json();
+  const doc = sjson.result?.[pmid];
+  if (!doc || doc.error) throw new Error('Not found in PubMed');
+  const ares = await fetch(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${pmid}&rettype=abstract&retmode=text`);
+  const atext = await ares.text();
+  let doi = null, pmcid = null;
+  (doc.articleids||[]).forEach(a => { if (a.idtype==='doi') doi=a.value; if (a.idtype==='pmc') pmcid=a.value; });
+  return {
+    title: (doc.title||'Untitled').replace(/<\/?[^>]+(>|$)/g,''),
+    authors: (doc.authors||[]).map(a=>a.name).join(', '),
+    journal: doc.fulljournalname || doc.source || '',
+    year: (doc.pubdate||'').match(/\d{4}/)?.[0] || '',
+    pmid, doi, pmcid,
+    abstract: extractAbstract(atext),
+    url: `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`
+  };
+}
+function extractAbstract(text) {
+  const lines = text.split('\n').filter(l=>l.trim());
+  const start = lines.findIndex(l => /^[A-Z][a-z].{20,}/.test(l) && !/^(Author|PMID|DOI|Copyright)/.test(l));
+  if (start === -1) return text.slice(0,500);
+  return lines.slice(start).join(' ').slice(0,800);
+}
+async function fetchByDOI(doi) {
+  const res = await fetch(`https://api.crossref.org/works/${encodeURIComponent(doi)}`);
+  if (!res.ok) throw new Error('DOI not found');
+  const item = (await res.json()).message;
+  return crossrefToPaper(item, null, doi);
+}
+async function fetchByTitle(title) {
+  const res = await fetch(`https://api.crossref.org/works?query.bibliographic=${encodeURIComponent(title)}&rows=1`);
+  const item = (await res.json()).message?.items?.[0];
+  if (!item) throw new Error('No results found');
+  return crossrefToPaper(item, title, item.DOI || null);
+}
+function crossrefToPaper(item, fallbackTitle, doi) {
+  const authors = (item.author||[]).map(a=>`${a.given||''} ${a.family||''}`.trim()).join(', ');
+  return {
+    title: (Array.isArray(item.title)?item.title[0]:item.title) || fallbackTitle || 'Untitled',
+    authors,
+    journal: (Array.isArray(item['container-title'])?item['container-title'][0]:item['container-title']) || '',
+    year: item.published?.['date-parts']?.[0]?.[0]?.toString() || '',
+    pmid: null, doi, pmcid: null,
+    abstract: item.abstract ? item.abstract.replace(/<\/?[^>]+(>|$)/g,'').slice(0,800) : '',
+    url: item.URL || (doi?`https://doi.org/${doi}`:'')
+  };
+}
+async function tryFetchPreviewImage(paper) {
+  if (paper.pmcid) {
+    const n = paper.pmcid.replace('PMC','');
+    return `https://europepmc.org/articles/PMC${n}/bin/fig1.jpg`; // best-effort guess
+  }
+  return null;
+}
+
+// ---------- Data layer (Supabase) ----------
+async function loadData() {
+  if (!sb) return;
+  const [{data: papers}, {data: votes}] = await Promise.all([
+    sb.from('papers').select('*'),
+    sb.from('votes').select('*')
+  ]);
+  state.papers = papers || [];
+  state.votes = votes || [];
+  state.loading = false;
+  render();
+}
+
+async function addPaper(p) {
+  const { error } = await sb.from('papers').insert({
+    title: p.title, authors: p.authors, journal: p.journal, year: p.year,
+    pmid: p.pmid, doi: p.doi, pmcid: p.pmcid, abstract: p.abstract, url: p.url,
+    image_url: p.imageUrl || null, description: p.description || null,
+    tags: p.tags || [], submitted_by: p.submittedBy || 'Anonymous'
+  });
+  if (error) alert('Could not save paper: ' + error.message);
+}
+
+function voteFor(paperId) {
+  return state.votes.find(v => v.paper_id === paperId && v.voter === voterId)?.direction || null;
+}
+async function handleVote(paperId, direction) {
+  const current = voteFor(paperId);
+  if (current === direction) {
+    await sb.from('votes').delete().eq('paper_id', paperId).eq('voter', voterId);
+  } else {
+    await sb.from('votes').upsert(
+      { paper_id: paperId, voter: voterId, direction },
+      { onConflict: 'paper_id,voter' }
+    );
+  }
+  await loadData();
+}
+
+function scoreFor(paperId) {
+  let up=0, down=0;
+  for (const v of state.votes) if (v.paper_id===paperId) { v.direction==='up'?up++:down++; }
+  return { up, down, score: up-down };
+}
+
+// ---------- Rendering ----------
+const ICON = {
+  up:'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/>',
+  down:'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>',
+  ext:'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>',
+  plus:'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>',
+  refresh:'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>'
+};
+function svg(inner, cls='w-5 h-5') {
+  return `<svg class="${cls}" fill="none" stroke="currentColor" viewBox="0 0 24 24">${inner}</svg>`;
+}
+
+function imgBlock(src, cls) {
+  if (!src) return `<div class="${cls} bg-gradient-to-br from-indigo-50 to-purple-50 flex items-center justify-center rounded-lg border border-indigo-100 text-indigo-200 text-xs">figure</div>`;
+  return `<div class="${cls} bg-slate-50 rounded-lg overflow-hidden border border-slate-200">
+    <img src="${esc(src)}" class="w-full h-full object-contain" onerror="this.parentElement.innerHTML='<div class=&quot;w-full h-full flex items-center justify-center text-indigo-200 text-xs&quot;>figure</div>'">
+  </div>`;
+}
+
+function render() {
+  const app = document.getElementById('app');
+  if (!configured) { app.innerHTML = setupScreen(); return; }
+
+  const allTags = [...new Set(state.papers.flatMap(p => p.tags||[]))].sort();
+  let list = state.activeTag ? state.papers.filter(p => (p.tags||[]).includes(state.activeTag)) : state.papers;
+  list = [...list].sort((a,b) => {
+    if (state.sortBy === 'top') return scoreFor(b.id).score - scoreFor(a.id).score;
+    return new Date(b.created_at) - new Date(a.created_at);
+  });
+
+  app.innerHTML = `
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h1 class="text-2xl font-bold text-slate-800">Journal Club</h1>
+        <p class="text-sm text-slate-400">Share, discuss, and vote on papers</p>
+      </div>
+      <button id="add-btn" class="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 text-white rounded-xl text-sm font-medium hover:bg-indigo-700 shadow-sm">
+        ${svg(ICON.plus,'w-4 h-4')} Add paper
+      </button>
+    </div>
+
+    <div class="mb-4 flex items-center gap-2">
+      <label class="text-xs text-slate-400">Your name:</label>
+      <input id="name-input" value="${esc(getName())}" placeholder="Anonymous"
+        class="px-2 py-1 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
+    </div>
+
+    <div class="flex items-center gap-2 mb-3">
+      <button data-sort="top" class="px-3 py-1.5 rounded-lg text-sm font-medium ${state.sortBy==='top'?'bg-slate-800 text-white':'text-slate-400 hover:bg-slate-100'}">Top</button>
+      <button data-sort="new" class="px-3 py-1.5 rounded-lg text-sm font-medium ${state.sortBy==='new'?'bg-slate-800 text-white':'text-slate-400 hover:bg-slate-100'}">Newest</button>
+      <button id="refresh-btn" class="ml-auto p-1.5 text-slate-300 hover:text-slate-500">${svg(ICON.refresh,'w-4 h-4')}</button>
+    </div>
+
+    ${allTags.length ? `<div class="flex flex-wrap items-center gap-1.5 mb-4">
+      <button data-tag="" class="text-xs px-2.5 py-1 rounded-full border ${!state.activeTag?'bg-slate-800 text-white border-slate-800':'bg-white text-slate-400 border-slate-200'}">All</button>
+      ${allTags.map(t=>`<button data-tag="${esc(t)}" class="text-xs px-2.5 py-1 rounded-full border ${tagColor(t)} ${state.activeTag===t?'ring-2 ring-offset-1 ring-slate-300':'opacity-60 hover:opacity-100'}">${esc(t)}</button>`).join('')}
+    </div>` : ''}
+
+    ${state.loading ? `<div class="text-center py-16 text-slate-300">Loading…</div>`
+      : list.length===0 ? `<div class="text-center py-16 text-slate-400"><p class="font-medium">No papers yet</p><p class="text-sm mt-1">Add the first one to get things going</p></div>`
+      : `<div class="space-y-3">${list.map(paperCard).join('')}</div>`}
+  `;
+}
+
+function paperCard(p) {
+  const { score } = scoreFor(p.id);
+  const uv = voteFor(p.id);
+  const scoreColor = score>0?'text-emerald-600':score<0?'text-rose-500':'text-slate-400';
+  return `
+  <div class="bg-white rounded-2xl border border-slate-200 p-4 flex gap-4 hover:shadow-md transition-shadow">
+    <div class="flex flex-col items-center gap-1 pt-1 w-12 shrink-0">
+      <button data-vote="up" data-id="${p.id}" class="p-1.5 rounded-lg ${uv==='up'?'bg-emerald-100 text-emerald-600':'text-slate-300 hover:bg-slate-50'}">${svg(ICON.up)}</button>
+      <span class="text-sm font-bold ${scoreColor}">${score}</span>
+      <button data-vote="down" data-id="${p.id}" class="p-1.5 rounded-lg ${uv==='down'?'bg-rose-100 text-rose-500':'text-slate-300 hover:bg-slate-50'}">${svg(ICON.down)}</button>
+    </div>
+    <div class="w-28 shrink-0 hidden sm:block">${imgBlock(p.image_url,'w-full h-32')}</div>
+    <div class="flex-1 min-w-0">
+      <div class="flex items-start justify-between gap-2">
+        <h3 class="font-semibold text-slate-800 leading-snug">${esc(p.title)}</h3>
+        ${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener" class="shrink-0 text-slate-300 hover:text-indigo-500 mt-0.5">${svg(ICON.ext,'w-4 h-4')}</a>`:''}
+      </div>
+      <p class="text-sm text-slate-500 mt-0.5">${esc(p.authors)}</p>
+      <p class="text-xs text-slate-400 italic mt-0.5">${esc(p.journal)}${p.year?' · '+esc(p.year):''}</p>
+      ${p.description?`<div class="mt-2 bg-indigo-50/60 border-l-2 border-indigo-200 pl-3 py-1.5 rounded-r-lg"><p class="text-sm text-slate-600">${esc(p.description)}</p></div>`:''}
+      ${(p.tags&&p.tags.length)?`<div class="flex flex-wrap gap-1.5 mt-2">${p.tags.map(t=>`<span class="text-xs px-2 py-0.5 rounded-full border ${tagColor(t)}">${esc(t)}</span>`).join('')}</div>`:''}
+      <div class="mt-2.5 flex items-center gap-2 text-xs text-slate-400">
+        <span>Added by ${esc(p.submitted_by||'Anonymous')}</span><span>·</span><span>${timeAgo(p.created_at)}</span>
+        ${p.pmid?`<span>· PMID ${esc(p.pmid)}</span>`:''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function setupScreen() {
+  return `<div class="bg-white border border-amber-200 rounded-2xl p-6 mt-8">
+    <h1 class="text-xl font-bold text-slate-800 mb-2">One-time setup needed</h1>
+    <p class="text-sm text-slate-600 mb-3">This app is ready — it just needs to be connected to your Supabase database so your team shares one list.</p>
+    <ol class="text-sm text-slate-600 list-decimal ml-5 space-y-1">
+      <li>Create a free project at supabase.com</li>
+      <li>Run the SQL setup (provided with this file) in the Supabase SQL editor</li>
+      <li>Open this HTML file in a text editor and paste your Project URL and anon key into the CONFIG block near the top</li>
+      <li>Save, reopen, and share the file with your team</li>
+    </ol>
+  </div>`;
+}
+
+// ---------- Add-paper modal ----------
+let modalPreview = null, modalTags = [];
+function openModal() {
+  modalPreview = null; modalTags = [];
+  renderModal();
+}
+function closeModal() { document.getElementById('modal-root').innerHTML = ''; }
+
+function renderModal() {
+  const allTags = [...new Set(state.papers.flatMap(p=>p.tags||[]))].sort();
+  const suggestions = allTags.filter(t=>!modalTags.includes(t)).slice(0,6);
+  const p = modalPreview;
+  document.getElementById('modal-root').innerHTML = `
+  <div id="overlay" class="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+    <div id="modal-box" class="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+      <div class="p-5 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white rounded-t-2xl">
+        <h2 class="text-lg font-semibold text-slate-800">Add a paper</h2>
+        <button id="close-modal" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+      </div>
+      <div class="p-5 space-y-4">
+        <div>
+          <label class="text-sm font-medium text-slate-600 mb-1.5 block">PMID, DOI, or title</label>
+          <div class="flex gap-2">
+            <input id="lookup-input" placeholder="e.g. 38472910 or 10.1038/… or a title"
+              class="flex-1 px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
+            <button id="lookup-btn" class="px-3 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700">Look up</button>
+          </div>
+          <p id="lookup-error" class="text-sm text-rose-500 mt-1.5 hidden"></p>
+        </div>
+        ${p ? `
+        <div class="border border-slate-200 rounded-xl p-4 bg-slate-50 space-y-3">
+          ${imgBlock(p.imageUrl,'w-full h-40')}
+          <h3 class="font-semibold text-slate-800 leading-snug">${esc(p.title)}</h3>
+          <p class="text-sm text-slate-500">${esc(p.authors)}</p>
+          <p class="text-sm text-slate-400 italic">${esc(p.journal)}${p.year?' · '+esc(p.year):''}</p>
+          ${p.abstract?`<p class="text-sm text-slate-600 line-clamp-4">${esc(p.abstract)}</p>`:''}
+          <div>
+            <label class="text-xs font-medium text-slate-500 mb-1 block">Preview image URL (optional)</label>
+            <input id="img-input" value="${esc(p.imageUrl||'')}" placeholder="https://…"
+              class="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400">
+          </div>
+          <div>
+            <label class="text-xs font-medium text-slate-500 mb-1 block">Your take / why it's worth reading</label>
+            <textarea id="desc-input" rows="3" placeholder="Add context for the group…"
+              class="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-400"></textarea>
+          </div>
+          <div>
+            <label class="text-xs font-medium text-slate-500 mb-1 block">Tags</label>
+            <div class="flex flex-wrap gap-1.5 mb-1.5">
+              ${modalTags.map(t=>`<span class="text-xs px-2 py-0.5 rounded-full border flex items-center gap-1 ${tagColor(t)}">${esc(t)}<button data-rmtag="${esc(t)}" class="hover:opacity-60">&times;</button></span>`).join('')}
+            </div>
+            <input id="tag-input" placeholder="Add tags (press Enter)…"
+              class="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
+            ${suggestions.length?`<div class="flex flex-wrap gap-1.5 mt-1.5">${suggestions.map(s=>`<button data-addtag="${esc(s)}" class="text-xs px-2 py-0.5 rounded-full border opacity-60 hover:opacity-100 ${tagColor(s)}">+ ${esc(s)}</button>`).join('')}</div>`:''}
+          </div>
+        </div>` : ''}
+      </div>
+      <div class="p-5 border-t border-slate-100 flex justify-end gap-2 sticky bottom-0 bg-white rounded-b-2xl">
+        <button id="cancel-modal" class="px-4 py-2 text-sm text-slate-500 hover:text-slate-700">Cancel</button>
+        <button id="save-paper" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 ${p?'':'opacity-40 pointer-events-none'}">Add to list</button>
+      </div>
+    </div>
+  </div>`;
+  wireModal();
+}
+
+async function doLookup() {
+  const val = document.getElementById('lookup-input').value.trim();
+  const errEl = document.getElementById('lookup-error');
+  const btn = document.getElementById('lookup-btn');
+  if (!val) return;
+  errEl.classList.add('hidden'); btn.textContent = '…'; btn.disabled = true;
+  try {
+    let data;
+    if (/^\d{6,9}$/.test(val)) data = await fetchPubMedByPMID(val);
+    else if (val.includes('pubmed.ncbi.nlm.nih.gov')) { const m=val.match(/(\d{6,9})/); if(!m) throw new Error('Could not read PMID'); data = await fetchPubMedByPMID(m[1]); }
+    else if (/^10\.\d{4,9}\//.test(val) || val.includes('doi.org/')) data = await fetchByDOI(val.replace(/^https?:\/\/(dx\.)?doi\.org\//,''));
+    else data = await fetchByTitle(val);
+    data.imageUrl = await tryFetchPreviewImage(data);
+    modalPreview = data; renderModal();
+    document.getElementById('lookup-input').value = val;
+  } catch(e) {
+    errEl.textContent = e.message || 'Could not find that paper.'; errEl.classList.remove('hidden');
+  } finally { btn.textContent='Look up'; btn.disabled=false; }
+}
+
+function wireModal() {
+  const $ = id => document.getElementById(id);
+  $('overlay').addEventListener('click', e => { if (e.target.id==='overlay') closeModal(); });
+  $('close-modal').onclick = closeModal;
+  $('cancel-modal').onclick = closeModal;
+  $('lookup-btn').onclick = doLookup;
+  $('lookup-input').addEventListener('keydown', e => { if (e.key==='Enter') doLookup(); });
+
+  if (modalPreview) {
+    const tagInput = $('tag-input');
+    tagInput.addEventListener('keydown', e => {
+      if ((e.key==='Enter'||e.key===',') && tagInput.value.trim()) {
+        e.preventDefault();
+        const t = tagInput.value.trim().toLowerCase();
+        if (!modalTags.includes(t)) modalTags.push(t);
+        tagInput.value=''; renderModal();
+      } else if (e.key==='Backspace' && !tagInput.value && modalTags.length) {
+        modalTags.pop(); renderModal();
+      }
+    });
+    document.querySelectorAll('[data-addtag]').forEach(b => b.onclick = () => { modalTags.push(b.dataset.addtag); renderModal(); });
+    document.querySelectorAll('[data-rmtag]').forEach(b => b.onclick = () => { modalTags = modalTags.filter(t=>t!==b.dataset.rmtag); renderModal(); });
+
+    $('save-paper').onclick = async () => {
+      const name = $('name-input') ? $('name-input').value.trim() : getName();
+      modalPreview.imageUrl = $('img-input').value.trim() || modalPreview.imageUrl;
+      modalPreview.description = $('desc-input').value.trim();
+      modalPreview.tags = modalTags;
+      modalPreview.submittedBy = getName() || 'Anonymous';
+      closeModal();
+      await addPaper(modalPreview);
+      await loadData();
+    };
+  }
+}
+
+// ---------- Global event wiring ----------
+document.getElementById('app').addEventListener('click', e => {
+  const voteBtn = e.target.closest('[data-vote]');
+  if (voteBtn) { handleVote(voteBtn.dataset.id, voteBtn.dataset.vote); return; }
+  const sortBtn = e.target.closest('[data-sort]');
+  if (sortBtn) { state.sortBy = sortBtn.dataset.sort==='new'?'new':'top'; render(); return; }
+  const tagBtn = e.target.closest('[data-tag]');
+  if (tagBtn) { const t = tagBtn.dataset.tag; state.activeTag = t? (state.activeTag===t?null:t):null; render(); return; }
+  if (e.target.closest('#add-btn')) { openModal(); return; }
+  if (e.target.closest('#refresh-btn')) { loadData(); return; }
+});
+document.getElementById('app').addEventListener('input', e => {
+  if (e.target.id === 'name-input') setName(e.target.value);
+});
+
+// ---------- Realtime + boot ----------
+if (configured) {
+  render();
+  loadData();
+  let t = null;
+  const debouncedReload = () => { clearTimeout(t); t = setTimeout(loadData, 300); };
+  sb.channel('jc-realtime')
+    .on('postgres_changes', { event:'*', schema:'public', table:'papers' }, debouncedReload)
+    .on('postgres_changes', { event:'*', schema:'public', table:'votes' }, debouncedReload)
+    .subscribe();
+} else {
+  render();
+}
+</script>
+</body>
+</html>
